@@ -134,6 +134,44 @@ docker compose up -d
 
 不要把 `/app` 运行时卷当作业务备份；它可以从发布镜像重新创建。不要使用 `docker compose down -v` 执行普通升级，因为该命令还会删除 Compose 管理的命名卷。
 
+### 本地 checkout 构建升级（仅默认 SQLite）
+
+当 feature 分支尚未发布到 GHCR、但已经通过 `scp`、`git bundle` 或其他人工方式传到生产 Docker 主机时，可以在生产主机上从该干净 checkout 本地构建并升级现有的安装器管理部署：
+
+```bash
+sudo INSTALL_DIR=/opt/chatgpt2api \
+  bash /path/to/chatgpt2api/deploy/build-and-upgrade.sh
+```
+
+先做离线预检（不构建、不停服务、不修改部署）：
+
+```bash
+sudo INSTALL_DIR=/opt/chatgpt2api \
+  bash /path/to/chatgpt2api/deploy/build-and-upgrade.sh --dry-run
+```
+
+脚本要求源码 checkout 没有未提交改动、生产机使用标准 `docker-compose.yml`、默认 SQLite 文件 `data/chatgpt2api.db`，并且现有 `chatgpt2api` 容器正在运行。它拒绝 PostgreSQL、非默认 SQLite 路径和自定义数据库 URL；这些部署应使用各自的备份与升级流程。
+
+脚本不会 fetch/checkout 源码，不会 push 或 pull 应用镜像，也不会执行 `docker compose down -v`。本地 Docker 构建使用当前完整 commit SHA 作为镜像标签；如果 Dockerfile 所需的基础镜像未缓存，Docker 本身可能访问基础镜像仓库。升级前会备份 SQLite、`.env` 和 `config.json`，成功后保留备份和旧镜像回滚标签。
+
+运行前会打印 commit、安装目录、镜像、备份目录和健康检查地址，并要求确认；自动化调用可显式加 `--yes`：
+
+```bash
+sudo INSTALL_DIR=/opt/chatgpt2api \
+  bash /path/to/chatgpt2api/deploy/build-and-upgrade.sh --yes
+```
+
+由于本分支没有修改 `VERSION`，脚本会清理受管运行卷中的 `.chatgpt2api-image-version`，让 entrypoint 从新镜像重新同步代码。构建失败不会停服务；重启或健康检查失败时会恢复备份文件和旧镜像。脚本只覆盖应用程序、默认 SQLite 和启动配置，不备份外部 WebDAV 或其他独立图片存储。
+
+升级完成后检查：
+
+```bash
+docker compose -f /opt/chatgpt2api/docker-compose.yml ps
+docker logs --tail=200 chatgpt2api
+```
+
+脚本的手动回滚备份位于 `/opt/chatgpt2api/backups/chatgpt2api-upgrade-*`。若自动回滚也失败，先停止 app，恢复备份目录中的 `chatgpt2api.db`、`.env`、`config.json`，再使用备份中记录的旧镜像回滚标签执行 `docker compose up -d --force-recreate app`。
+
 ### 命令行升级
 
 镜像部署升级：
