@@ -26,11 +26,11 @@ from services.protocol.openai_tool_call_bridge import (
     UpstreamToolCallError,
     build_tool_instruction,
     has_tool_history,
+    looks_like_envelope_start,
     normalize_tool_choice,
     normalize_tools,
     parse_tool_call_envelope,
     serialize_tool_history,
-    tool_definitions_from_history,
 )
 from services.protocol.reasoning import thinking_effort_from_body
 from services.protocol.web_search_tool import (
@@ -357,8 +357,7 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
 def _has_client_tool_request(body: dict[str, Any]) -> bool:
     tools = body.get("tools")
     if isinstance(tools, list) and any(
-        isinstance(tool, dict)
-        and str(tool.get("type") or "") not in WEB_SEARCH_TOOL_TYPES
+        isinstance(tool, dict) and tool.get("type") == "function"
         for tool in tools
     ):
         return True
@@ -370,9 +369,8 @@ def _tool_request_parts(
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], bool]:
     messages = chat_messages_from_body(body)
     tools = normalize_tools(body)
-    if not tools and has_tool_history(messages):
-        tools = tool_definitions_from_history(messages)
-    tool_choice = normalize_tool_choice(body, tools) if tools else {"mode": "auto"}
+    # Without declared tools the client wants a final answer, so no call may be offered.
+    tool_choice = normalize_tool_choice(body, tools) if tools else {"mode": "none"}
     parallel = body.get("parallel_tool_calls") is not False
     serialized = serialize_tool_history(messages)
     if tools:
@@ -443,7 +441,32 @@ def _stream_tool_completion_events(
             messages=messages,
             thinking_effort=thinking_effort_from_body(body),
         )
-        text = "".join(stream_text_deltas(backend, request))
+        deltas = stream_text_deltas(backend, request)
+        text = ""
+        if tool_choice.get("mode") in {"auto", "none"}:
+            # Stream plain-text answers as they arrive; buffer only replies that may be an envelope.
+            for delta in deltas:
+                text += delta
+                if not text.strip():
+                    continue
+                if looks_like_envelope_start(text):
+                    break
+                yield _with_log_metadata(
+                    completion_chunk(model, {"role": "assistant", "content": text}, None, completion_id, created),
+                    _backend_account_email(backend),
+                )
+                for rest in deltas:
+                    if rest:
+                        yield _with_log_metadata(
+                            completion_chunk(model, {"content": rest}, None, completion_id, created),
+                            _backend_account_email(backend),
+                        )
+                yield _with_log_metadata(
+                    completion_chunk(model, {}, "stop", completion_id, created),
+                    _backend_account_email(backend),
+                )
+                return
+        text += "".join(deltas)
         try:
             answer, calls = parse_tool_call_envelope(text, tools, tool_choice, parallel=parallel)
         except UpstreamToolCallError as exc:

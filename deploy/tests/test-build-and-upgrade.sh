@@ -85,6 +85,7 @@ DATABASE_URL=
 EOF
   printf '{"auth-key":"secret-value"}\n' >"$install/config.json"
   printf 'original-db\n' >"$install/data/chatgpt2api.db"
+  printf 'original-wal\n' >"$install/data/chatgpt2api.db-wal"
   cat >"$install/docker-compose.yml" <<'EOF'
 services:
   app:
@@ -154,6 +155,10 @@ if [[ "${1:-}" == compose ]]; then
     fi
   elif printf '%s\n' "$@" | grep -qx up; then
     printf 'running\n' >"$state/app_state"
+    if grep -q '^CHATGPT2API_IMAGE=chatgpt2api:branch-' "$INSTALL_DIR/.env"; then
+      printf 'new-wal\n' >"$INSTALL_DIR/data/chatgpt2api.db-wal"
+      printf 'new-shm\n' >"$INSTALL_DIR/data/chatgpt2api.db-shm"
+    fi
   fi
   if [[ "${FAKE_COMPOSE_FAIL:-0}" == 1 && "${*}" == *" up "* && ! -e "$state/compose_failed" ]]; then
     : >"$state/compose_failed"
@@ -167,11 +172,26 @@ EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 state="${FAKE_STATE_DIR:?}"
+if [[ "${FAKE_HEALTH_FAIL_ALWAYS:-0}" == 1 ]]; then
+  exit 22
+fi
 if [[ "${FAKE_HEALTH_FAIL:-0}" == 1 && ! -e "$state/health_failed" ]]; then
   : >"$state/health_failed"
   exit 22
 fi
 exit 0
+EOF
+  local real_git
+  real_git="$(command -v git)"
+  cat >"$fake_bin/git" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'git %s\\n' "\$*" >>"\${FAKE_STATE_DIR:?}/commands.log"
+if [[ "\${FAKE_GIT_STATUS_FAIL:-0}" == 1 && " \$* " == *" status "* ]]; then
+  printf 'fatal: detected dubious ownership\\n' >&2
+  exit 128
+fi
+exec "$real_git" "\$@"
 EOF
   cat >"$fake_bin/cp" <<'EOF'
 #!/usr/bin/env bash
@@ -181,7 +201,7 @@ if [[ "${FAKE_COPY_FAIL:-0}" == 1 && "${1:-}" == "${INSTALL_DIR}/data/chatgpt2ap
 fi
 exec /bin/cp "$@"
 EOF
-  chmod +x "$fake_bin/docker" "$fake_bin/curl" "$fake_bin/cp" "$source/deploy/build-and-upgrade.sh"
+  chmod +x "$fake_bin/docker" "$fake_bin/curl" "$fake_bin/cp" "$fake_bin/git" "$source/deploy/build-and-upgrade.sh"
 
 }
 
@@ -234,6 +254,11 @@ case "${1:-all}" in
     backup_db="$(find "$install/backups" -name chatgpt2api.db -type f | head -n 1)"
     [[ -n "$backup_db" ]] || fail 'backup database was not created'
     assert_file_equals "$backup_db" "$original_db"
+    backup_dir="$(dirname "$backup_db")"
+    assert_file_contains "$backup_dir/chatgpt2api.db-wal" 'original-wal'
+    assert_file_contains "$backup_dir/ROLLBACK_IMAGE" 'chatgpt2api:rollback-'
+    ! grep -F 'docker build' "$state/commands.log" | grep -F -- '--pull' >/dev/null || fail 'build must not force --pull'
+    grep -F 'safe.directory=' "$state/commands.log" >/dev/null || fail 'git must run with safe.directory for sudo use'
 
     make_fixture
     source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
@@ -254,7 +279,26 @@ case "${1:-all}" in
     assert_file_equals "$WORK_DIR/after.env.rest" "$WORK_DIR/before.env.rest"
     assert_file_contains "$install/.env" 'CHATGPT2API_IMAGE=chatgpt2api:rollback-'
     assert_file_equals "$install/data/chatgpt2api.db" "$WORK_DIR/before.db"
+    assert_file_contains "$install/data/chatgpt2api.db-wal" 'original-wal'
+    [[ ! -e "$install/data/chatgpt2api.db-shm" ]] || fail 'rollback left the new SQLite SHM file in place'
     assert_file_contains "$state/commands.log" 'docker compose'
+
+    make_fixture
+    source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
+    if FAKE_HEALTH_FAIL_ALWAYS=1 run_upgrade "$source" "$install" "$fake_bin" "$state" 2>"$WORK_DIR/rollback-failed.err"; then
+      fail 'permanent health failure unexpectedly succeeded'
+    fi
+    assert_file_contains "$WORK_DIR/rollback-failed.err" 'Rollback failed'
+    assert_file_contains "$WORK_DIR/rollback-failed.err" '.chatgpt2api-image-version'
+    assert_file_contains "$WORK_DIR/rollback-failed.err" 'chatgpt2api:rollback-'
+
+    make_fixture
+    source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
+    if FAKE_GIT_STATUS_FAIL=1 run_upgrade "$source" "$install" "$fake_bin" "$state" --dry-run 2>"$WORK_DIR/git-failed.err"; then
+      fail 'git status failure unexpectedly passed preflight'
+    fi
+    assert_file_contains "$WORK_DIR/git-failed.err" 'ERROR: git status failed'
+    ! grep -F 'docker build' "$state/commands.log" >/dev/null || fail 'git failure reached build'
 
     make_fixture
     source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
@@ -320,6 +364,9 @@ case "${1:-all}" in
     assert_file_contains "$ROOT_DIR/docs/deployment.md" 'build-and-upgrade.sh'
     assert_file_contains "$ROOT_DIR/docs/deployment.md" 'data/chatgpt2api.db'
     assert_file_contains "$ROOT_DIR/docs/deployment.md" '不会 fetch/checkout 源码'
+    assert_file_contains "$ROOT_DIR/docs/deployment.md" '.chatgpt2api-image-version'
+    assert_file_contains "$ROOT_DIR/docs/deployment.md" 'ROLLBACK_IMAGE'
+    assert_file_contains "$ROOT_DIR/docs/deployment.md" 'chatgpt2api.db-wal'
     ;;
   *)
     fail "unknown test case: $1"

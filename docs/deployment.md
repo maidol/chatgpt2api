@@ -152,7 +152,7 @@ sudo INSTALL_DIR=/opt/chatgpt2api \
 
 脚本要求源码 checkout 没有未提交改动、生产机使用标准 `docker-compose.yml`、默认 SQLite 文件 `data/chatgpt2api.db`，并且现有 `chatgpt2api` 容器正在运行。它拒绝 PostgreSQL、非默认 SQLite 路径和自定义数据库 URL；这些部署应使用各自的备份与升级流程。
 
-脚本不会 fetch/checkout 源码，不会 push 或 pull 应用镜像，也不会执行 `docker compose down -v`。本地 Docker 构建使用当前完整 commit SHA 作为镜像标签；如果 Dockerfile 所需的基础镜像未缓存，Docker 本身可能访问基础镜像仓库。升级前会备份 SQLite、`.env` 和 `config.json`，成功后保留备份和旧镜像回滚标签。
+脚本不会 fetch/checkout 源码，不会 push 或 pull 应用镜像，也不会执行 `docker compose down -v`。本地 Docker 构建使用当前完整 commit SHA 作为镜像标签，并优先使用已缓存的基础镜像；只有缺少所需基础镜像层时，Docker 才会访问基础镜像仓库。升级前会备份 SQLite（包括 WAL 模式下的 `chatgpt2api.db-wal` / `chatgpt2api.db-shm`）、`.env` 和 `config.json`，并把旧镜像回滚标签写入备份目录的 `ROLLBACK_IMAGE`；成功后保留备份和回滚标签。
 
 运行前会打印 commit、安装目录、镜像、备份目录和健康检查地址，并要求确认；自动化调用可显式加 `--yes`：
 
@@ -170,7 +170,20 @@ docker compose -f /opt/chatgpt2api/docker-compose.yml ps
 docker logs --tail=200 chatgpt2api
 ```
 
-脚本的手动回滚备份位于 `/opt/chatgpt2api/backups/chatgpt2api-upgrade-*`。若自动回滚也失败，先停止 app，恢复备份目录中的 `chatgpt2api.db`、`.env`、`config.json`，再使用备份中记录的旧镜像回滚标签执行 `docker compose up -d --force-recreate app`。
+脚本的手动回滚备份位于 `/opt/chatgpt2api/backups/chatgpt2api-upgrade-*`。若自动回滚也失败，脚本会打印完整的恢复命令；手动步骤为：
+
+1. 停止 app：`docker compose -f docker-compose.yml stop app`。
+2. 恢复备份目录中的 `chatgpt2api.db`；删除当前的 `chatgpt2api.db-wal` / `chatgpt2api.db-shm`，若备份中有这两个文件则一并恢复；再恢复 `.env` 和 `config.json`。
+3. 将 `.env` 中的 `CHATGPT2API_IMAGE` 设为备份目录 `ROLLBACK_IMAGE` 文件记录的旧镜像标签。
+4. 清除受管运行卷中的 `.chatgpt2api-image-version`，否则旧镜像会因 `VERSION` 相同而跳过重新同步、继续运行新代码：
+
+   ```bash
+   docker run --rm -v <运行卷名>:/app --entrypoint python <旧镜像标签> \
+     -c 'from pathlib import Path; Path("/app/.chatgpt2api-image-version").unlink(missing_ok=True)'
+   ```
+
+   运行卷名可用 `docker volume ls | grep chatgpt2api-runtime` 查看。
+5. 执行 `docker compose -f docker-compose.yml up -d --no-build --force-recreate app`。
 
 ### 命令行升级
 

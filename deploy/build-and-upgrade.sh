@@ -37,8 +37,8 @@ Options:
   -h, --help          Show this help
 
 The script never fetches or checks out source and never pushes or pulls the
-application image. Docker may access Dockerfile base-image registries during
-the local build when those layers are not cached.
+application image. The local build uses cached base images and contacts a
+base-image registry only when a required layer is missing.
 EOF
 }
 
@@ -142,6 +142,17 @@ finally:
 PY
 }
 
+source_git() {
+  # The operator may run this with sudo on a checkout owned by another user.
+  git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" "$@"
+}
+
+marker_clear_command() {
+  printf 'docker run --rm -v %q:/app --entrypoint python %q -c %q' \
+    "$RUNTIME_VOLUME" "$1" \
+    'from pathlib import Path; Path("/app/.chatgpt2api-image-version").unlink(missing_ok=True)'
+}
+
 compose() {
   (cd "$INSTALL_DIR" && docker compose -f "$COMPOSE_FILE" "$@")
 }
@@ -175,7 +186,7 @@ rollback() {
   set +e
   compose stop app >/dev/null 2>&1 || rollback_ok=0
   if ((BACKUP_COMPLETE)); then
-    cp "$BACKUP_DIR/chatgpt2api.db" "$DB_FILE" || rollback_ok=0
+    restore_database || rollback_ok=0
     cp "$BACKUP_DIR/config.json" "$CONFIG_FILE" || rollback_ok=0
     if ! cp "$BACKUP_DIR/.env" "$ENV_FILE"; then
       rollback_ok=0
@@ -192,8 +203,12 @@ rollback() {
   if ((rollback_ok)); then
     printf 'Rollback restored the previous application image and service.\n' >&2
   else
-    printf 'Rollback failed. Restore files from %s and run:\n' "$BACKUP_DIR" >&2
-    printf '  cd %s && docker compose -f docker-compose.yml up -d --no-build --force-recreate app\n' "$INSTALL_DIR" >&2
+    printf 'Rollback failed. Recover manually:\n' >&2
+    printf '  1. cd %q && docker compose -f docker-compose.yml stop app\n' "$INSTALL_DIR" >&2
+    printf '  2. Restore chatgpt2api.db (and any -wal/-shm, deleting the current ones), .env and config.json from %s\n' "$BACKUP_DIR" >&2
+    printf '  3. Set CHATGPT2API_IMAGE=%s in .env (also recorded in %s/ROLLBACK_IMAGE)\n' "$ROLLBACK_IMAGE_TAG" "$BACKUP_DIR" >&2
+    printf '  4. Clear the runtime marker so the old image reseeds /app:\n     %s\n' "$(marker_clear_command "$ROLLBACK_IMAGE_TAG")" >&2
+    printf '  5. docker compose -f docker-compose.yml up -d --no-build --force-recreate app\n' >&2
   fi
   return $((rollback_ok == 1 ? 0 : 1))
 }
@@ -205,8 +220,10 @@ preflight() {
   command_exists curl || die 'curl is required'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required'
   [[ -d "$SOURCE_DIR/.git" ]] || die "source is not a Git checkout: $SOURCE_DIR"
-  [[ -z "$(cd "$SOURCE_DIR" && git status --porcelain)" ]] || die 'source checkout has uncommitted changes'
-  SOURCE_COMMIT="$(cd "$SOURCE_DIR" && git rev-parse HEAD)"
+  local source_status
+  source_status="$(source_git status --porcelain)" || die "git status failed for $SOURCE_DIR"
+  [[ -z "$source_status" ]] || die 'source checkout has uncommitted changes'
+  SOURCE_COMMIT="$(source_git rev-parse HEAD)" || die "git rev-parse failed for $SOURCE_DIR"
 
   [[ -d "$INSTALL_DIR" ]] || die "install directory does not exist: $INSTALL_DIR"
   COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
@@ -253,6 +270,7 @@ print_summary() {
   printf 'Install directory: %s\n' "$INSTALL_DIR"
   printf 'Local image: %s\n' "$NEW_IMAGE_TAG"
   printf 'Backup directory: %s\n' "$BACKUP_DIR"
+  printf 'Rollback image tag: %s\n' "$ROLLBACK_IMAGE_TAG"
   printf 'Health URL: http://127.0.0.1:%s/\n' "$CHATGPT2API_PORT"
 }
 
@@ -265,19 +283,40 @@ confirm_upgrade() {
 }
 
 create_backup() {
+  local suffix
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
+  printf '%s\n' "$ROLLBACK_IMAGE_TAG" >"$BACKUP_DIR/ROLLBACK_IMAGE" || return 1
   cp "$DB_FILE" "$BACKUP_DIR/chatgpt2api.db" || return 1
+  # SQLite runs in WAL mode: committed rows may still live in the -wal file.
+  for suffix in -wal -shm; do
+    if [[ -e "${DB_FILE}${suffix}" ]]; then
+      cp "${DB_FILE}${suffix}" "$BACKUP_DIR/chatgpt2api.db${suffix}" || return 1
+    fi
+  done
   cp "$ENV_FILE" "$BACKUP_DIR/.env" || return 1
   cp "$CONFIG_FILE" "$BACKUP_DIR/config.json" || return 1
-  chmod 600 "$BACKUP_DIR/chatgpt2api.db" "$BACKUP_DIR/.env" "$BACKUP_DIR/config.json"
+  chmod 600 "$BACKUP_DIR"/*
+  chmod 600 "$BACKUP_DIR/.env"
   : >"$BACKUP_DIR/BACKUP_COMPLETE"
   BACKUP_COMPLETE=1
 }
 
+restore_database() {
+  local suffix
+  cp "$BACKUP_DIR/chatgpt2api.db" "$DB_FILE" || return 1
+  for suffix in -wal -shm; do
+    # Never leave the new version's WAL/SHM beside the restored database.
+    rm -f "${DB_FILE}${suffix}" || return 1
+    if [[ -e "$BACKUP_DIR/chatgpt2api.db${suffix}" ]]; then
+      cp "$BACKUP_DIR/chatgpt2api.db${suffix}" "${DB_FILE}${suffix}" || return 1
+    fi
+  done
+}
+
 upgrade() {
   confirm_upgrade || die 'upgrade cancelled'
-  docker build --pull -t "$NEW_IMAGE_TAG" "$SOURCE_DIR" || die 'local Docker build failed; production was not changed'
+  docker build -t "$NEW_IMAGE_TAG" "$SOURCE_DIR" || die 'local Docker build failed; production was not changed'
   docker tag "$OLD_IMAGE_ID" "$ROLLBACK_IMAGE_TAG" || die 'could not create rollback image tag'
   if ! compose stop app; then
     printf 'Could not stop the app service cleanly; attempting to restart the old application.\n' >&2
@@ -314,6 +353,7 @@ upgrade() {
   printf 'Source commit: %s\n' "$SOURCE_COMMIT"
   printf 'Image: %s\n' "$NEW_IMAGE_TAG"
   printf 'Backup: %s\n' "$BACKUP_DIR"
+  printf 'Rollback image tag: %s\n' "$ROLLBACK_IMAGE_TAG"
 }
 
 main() {

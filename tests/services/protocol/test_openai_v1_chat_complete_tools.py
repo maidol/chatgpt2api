@@ -106,16 +106,36 @@ def test_non_streaming_invalid_tool_envelope_maps_to_502_without_leak(monkeypatc
     assert marker not in str(error.value.detail)
 
 
-def test_function_tool_rejects_web_search_mix(monkeypatch):
-    monkeypatch.setattr(chat, "text_backend", lambda: pytest.fail("backend must not run"))
+def test_function_tool_mixed_with_web_search_uses_function_tools_only(monkeypatch):
+    backend = FakeBackend(envelope())
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(chat, "collect_text", lambda _backend, request: backend.collect(request))
 
-    with pytest.raises(HTTPException) as error:
-        chat.handle({
-            "messages": [{"role": "user", "content": "Search"}],
-            "tools": [tool(), {"type": "web_search"}],
-        })
+    response = chat.handle({
+        "messages": [{"role": "user", "content": "Search"}],
+        "tools": [tool(), {"type": "web_search"}],
+    })
 
-    assert error.value.status_code == 400
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+    assert '"name":"lookup"' in backend.messages[0]["content"]
+
+
+def test_non_function_tools_only_keep_tool_unavailable_text_path(monkeypatch):
+    backend = FakeBackend("Plain answer.")
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(chat, "collect_text", lambda _backend, request: backend.collect(request))
+    monkeypatch.setattr(chat, "text_completion_response", lambda model, messages, effort: {
+        "route": "text",
+        "messages": messages,
+    })
+
+    response = chat.handle({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{"type": "custom", "name": "apply_patch"}],
+    })
+
+    assert response["route"] == "text"
+    assert response["messages"][0]["content"] == chat.TOOL_UNAVAILABLE_SYSTEM_MESSAGE
 
 
 def test_function_tool_rejects_undeclared_forced_choice(monkeypatch):
@@ -152,6 +172,7 @@ def test_tool_history_round_trip_resumes_with_tool_result(monkeypatch):
     response = chat.handle({"messages": messages})
 
     assert response["choices"][0]["message"]["content"] == "The result says it is sunny."
+    assert all("Available functions" not in str(message["content"]) for message in backend.messages)
     serialized = [message["content"] for message in backend.messages]
     assert any("call_abc" in content for content in serialized)
     result_content = next(content for content in serialized if "Sunny, 26C" in content)
@@ -204,6 +225,53 @@ def test_streaming_function_tool_returns_regular_text_chunks(monkeypatch):
 
     assert "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks) == "Hello world"
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_streaming_text_answer_is_emitted_before_upstream_finishes(monkeypatch):
+    backend = FakeBackend("unused")
+    requested = []
+
+    def fake_stream(_backend, _request):
+        requested.append("first")
+        yield "Hello"
+        requested.append("second")
+        yield " world"
+        requested.append("done")
+
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(chat, "stream_text_deltas", fake_stream)
+
+    chunks = chat.handle({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [tool()],
+        "stream": True,
+    })
+    first = next(chunks)
+
+    assert first["choices"][0]["delta"].get("content") == "Hello"
+    assert "done" not in requested
+    rest = list(chunks)
+    assert "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in [first, *rest]) == "Hello world"
+    assert rest[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_streaming_fenced_envelope_is_buffered_and_not_leaked(monkeypatch):
+    backend = FakeBackend("unused")
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(
+        chat,
+        "stream_text_deltas",
+        lambda _backend, _request: iter(["```json\n", envelope(), "\n```"]),
+    )
+
+    chunks = list(chat.handle({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [tool()],
+        "stream": True,
+    }))
+
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert all("__chatgpt2api_tool_call__" not in json.dumps(chunk) for chunk in chunks)
 
 
 def test_streaming_invalid_envelope_fails_before_first_chunk_and_does_not_leak(monkeypatch):
@@ -312,3 +380,33 @@ def test_malformed_tool_history_is_rejected_before_backend(monkeypatch):
         chat.handle({"messages": [{"role": "tool", "tool_call_id": "missing", "content": "result"}]})
 
     assert error.value.status_code == 400
+
+
+def test_streaming_follow_up_without_tools_streams_final_answer(monkeypatch):
+    backend = FakeBackend("unused")
+    requested = []
+
+    def fake_stream(_backend, _request):
+        yield "Sunny"
+        requested.append("second")
+        yield " today"
+
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(chat, "stream_text_deltas", fake_stream)
+
+    chunks = chat.handle({
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "Weather?"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_a", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "Sunny"},
+        ],
+    })
+    first = next(chunks)
+
+    assert first["choices"][0]["delta"].get("content") == "Sunny"
+    assert requested == []
+    assert list(chunks)[-1]["choices"][0]["finish_reason"] == "stop"
