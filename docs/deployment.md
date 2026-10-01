@@ -152,7 +152,9 @@ sudo INSTALL_DIR=/opt/chatgpt2api \
 
 脚本要求源码 checkout 没有未提交改动、生产机使用标准 `docker-compose.yml`、默认 SQLite 文件 `data/chatgpt2api.db`，并且现有 `chatgpt2api` 容器正在运行。它拒绝 PostgreSQL、非默认 SQLite 路径和自定义数据库 URL；这些部署应使用各自的备份与升级流程。
 
-脚本不会 fetch/checkout 源码，不会 push 或 pull 应用镜像，也不会执行 `docker compose down -v`。本地 Docker 构建使用当前完整 commit SHA 作为镜像标签，并优先使用已缓存的基础镜像；只有缺少所需基础镜像层时，Docker 才会访问基础镜像仓库。升级前会备份 SQLite（包括 WAL 模式下的 `chatgpt2api.db-wal` / `chatgpt2api.db-shm`）、`.env` 和 `config.json`，并把旧镜像回滚标签写入备份目录的 `ROLLBACK_IMAGE`；成功后保留备份和回滚标签。
+脚本还要求运行中 `/app/VERSION`、当前镜像种子 `/opt/chatgpt2api/VERSION` 与源码 `VERSION` 三者一致。控制台在线更新过的部署（`/app` 版本高于镜像种子）会被拒绝：入口脚本重新同步 `/app` 时会丢弃在线更新的代码，回滚也只能恢复旧镜像种子而不是原先运行的代码。版本不一致时应走镜像发布升级流程。
+
+脚本不会 fetch/checkout 源码，不会 push 或 pull 应用镜像，也不会执行 `docker compose down -v`。本地 Docker 构建使用当前完整 commit SHA 作为镜像标签，并复用已缓存的构建层；缓存未命中时，Docker 可能访问基础镜像仓库，构建步骤也可能访问 npm 与 Python 包索引。升级前会备份 SQLite（包括 WAL 模式下的 `chatgpt2api.db-wal` / `chatgpt2api.db-shm`）、`.env` 和 `config.json`，并把旧镜像回滚标签写入备份目录的 `ROLLBACK_IMAGE`；成功后保留备份和回滚标签。
 
 运行前会打印 commit、安装目录、镜像、备份目录和健康检查地址，并要求确认；自动化调用可显式加 `--yes`：
 
@@ -161,7 +163,7 @@ sudo INSTALL_DIR=/opt/chatgpt2api \
   bash /path/to/chatgpt2api/deploy/build-and-upgrade.sh --yes
 ```
 
-由于本分支没有修改 `VERSION`，脚本会清理受管运行卷中的 `.chatgpt2api-image-version`，让 entrypoint 从新镜像重新同步代码。构建失败不会停服务；重启或健康检查失败时会恢复备份文件和旧镜像。脚本只覆盖应用程序、默认 SQLite 和启动配置，不备份外部 WebDAV 或其他独立图片存储。
+由于本分支没有修改 `VERSION`，脚本会清理受管运行卷中的 `.chatgpt2api-image-version`，让 entrypoint 从新镜像重新同步代码。构建失败不会停服务；重启或健康检查失败时会恢复备份文件和旧镜像。停服之后若收到 Ctrl-C、`TERM` 或 SSH 断开的 `HUP`，脚本同样执行回滚，回滚期间忽略再次中断；仍建议在 `tmux` / `screen` 中运行。脚本只覆盖应用程序、默认 SQLite 和启动配置，不备份外部 WebDAV 或其他独立图片存储。
 
 升级完成后检查：
 

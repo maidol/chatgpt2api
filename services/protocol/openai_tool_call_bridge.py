@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
 
 _ENVELOPE_MARKER = '"__chatgpt2api_tool_call__"'
+_ENVELOPE_PREFIXES = ('{"__chatgpt2api_tool_call__"', '{"tool_calls"')
+_FENCE_INFO_RE = re.compile(r"[A-Za-z0-9_-]{0,20}\s*")
 
 
 class ToolCallRequestError(ValueError):
@@ -185,6 +188,9 @@ def serialize_tool_history(messages: object) -> list[dict[str, Any]]:
                 arguments_text = function.get("arguments")
                 if not isinstance(arguments_text, str):
                     raise ToolCallRequestError("assistant tool call arguments must be a JSON string")
+                if not arguments_text.strip():
+                    # Some clients echo a no-argument call as "" rather than "{}".
+                    arguments_text = "{}"
                 try:
                     arguments = json.loads(arguments_text)
                 except json.JSONDecodeError as exc:
@@ -285,6 +291,59 @@ def looks_like_envelope_start(text: str) -> bool:
     """Whether a reply begins the way a tool-call envelope does (raw JSON or a code fence)."""
     stripped = str(text or "").lstrip()
     return stripped.startswith("{") or stripped.startswith("`")
+
+
+def envelope_hold_state(text: str) -> str:
+    """Classify streamed text starting at a `{` or backtick against the private envelope.
+
+    Returns "committed" once it has begun an envelope, "candidate" while it may
+    still become one, and "release" when it can no longer be one.
+    """
+    body = text
+    if body.startswith("`"):
+        fence = len(body) - len(body.lstrip("`"))
+        if fence < 3:
+            return "candidate" if fence == len(body) else "release"
+        rest = body[fence:]
+        newline = rest.find("\n")
+        info = rest if newline == -1 else rest[:newline]
+        if not _FENCE_INFO_RE.fullmatch(info):
+            return "release"
+        if newline == -1:
+            return "candidate"
+        body = rest[newline + 1:].lstrip()
+        if not body:
+            return "candidate"
+        if not body.startswith("{"):
+            return "release"
+    compact = re.sub(r"\s+", "", body[:256])
+    for prefix in _ENVELOPE_PREFIXES:
+        if compact.startswith(prefix):
+            return "committed"
+    if any(prefix.startswith(compact) for prefix in _ENVELOPE_PREFIXES):
+        return "candidate"
+    return "release"
+
+
+def split_envelope_hold(text: str) -> tuple[str, str, bool]:
+    """Split streamed text into a releasable prefix and a tail that may be the envelope.
+
+    Returns (released, held, committed); `committed` means the held tail has begun
+    an envelope, so everything that follows must be held until the reply ends.
+    """
+    released = ""
+    while True:
+        starts = [index for index in (text.find("{"), text.find("`")) if index != -1]
+        if not starts:
+            return released + text, "", False
+        start = min(starts)
+        released += text[:start]
+        text = text[start:]
+        state = envelope_hold_state(text)
+        if state != "release":
+            return released, text, state == "committed"
+        released += text[0]
+        text = text[1:]
 
 
 def _find_envelope(text: str) -> dict[str, Any] | None:

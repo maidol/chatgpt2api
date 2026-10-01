@@ -274,6 +274,53 @@ def test_streaming_fenced_envelope_is_buffered_and_not_leaked(monkeypatch):
     assert all("__chatgpt2api_tool_call__" not in json.dumps(chunk) for chunk in chunks)
 
 
+def test_streaming_prose_before_envelope_streams_prose_and_returns_tool_calls(monkeypatch):
+    backend = FakeBackend("unused")
+    text = "I will look it up. " + envelope()
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(
+        chat,
+        "stream_text_deltas",
+        lambda _backend, _request: iter([text[i:i + 7] for i in range(0, len(text), 7)]),
+    )
+
+    chunks = list(chat.handle({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [tool()],
+        "stream": True,
+    }))
+
+    deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
+    assert "".join(delta.get("content", "") for delta in deltas) == "I will look it up. "
+    assert sum(1 for delta in deltas if delta.get("role") == "assistant") == 1
+    calls = [call for delta in deltas for call in delta.get("tool_calls", [])]
+    assert [call["function"]["name"] for call in calls] == ["lookup"]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert all("__chatgpt2api_tool_call__" not in json.dumps(chunk) for chunk in chunks)
+
+
+def test_streaming_braces_and_code_in_text_answer_are_released(monkeypatch):
+    backend = FakeBackend("unused")
+    text = 'Use `x` and {"a": 1}:\n```python\nprint({1})\n```\nDone {'
+    monkeypatch.setattr(chat, "text_backend", lambda: backend)
+    monkeypatch.setattr(chat, "stream_text_deltas", lambda _backend, _request: iter(list(text)))
+
+    chunks = chat.handle({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [tool()],
+        "stream": True,
+    })
+    collected = list(chunks)
+
+    contents = [chunk["choices"][0]["delta"].get("content", "") for chunk in collected]
+    contents = [content for content in contents if content]
+    assert "".join(contents) == text
+    # Only the trailing, possibly-envelope "{" is held until upstream ends.
+    assert contents[-1] == "{"
+    assert len(contents) > 20
+    assert collected[-1]["choices"][0]["finish_reason"] == "stop"
+
+
 def test_streaming_invalid_envelope_fails_before_first_chunk_and_does_not_leak(monkeypatch):
     marker = '{"__chatgpt2api_tool_call__":true,"tool_calls":["bad"]}'
     backend = FakeBackend("unused")

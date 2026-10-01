@@ -21,7 +21,9 @@ BACKUP_DIR=""
 BACKUP_COMPLETE=0
 ROLLBACK_STARTED=0
 SOURCE_COMMIT=""
+SOURCE_VERSION=""
 CHATGPT2API_PORT=""
+MUTATING=0
 
 usage() {
   cat <<'EOF'
@@ -37,8 +39,13 @@ Options:
   -h, --help          Show this help
 
 The script never fetches or checks out source and never pushes or pulls the
-application image. The local build uses cached base images and contacts a
-base-image registry only when a required layer is missing.
+application image. The local build reuses cached layers; when a layer is not
+cached, Docker may contact the base-image registry and the build steps may
+contact the npm and Python package indexes.
+
+The running /app VERSION, the current image's seed VERSION and the source
+VERSION must all match, so the upgrade cannot silently replace a console
+online update and a rollback restores the code that was running.
 EOF
 }
 
@@ -183,6 +190,8 @@ rollback() {
     return 1
   fi
   ROLLBACK_STARTED=1
+  # A second Ctrl-C must not abandon a half-finished rollback.
+  trap '' INT TERM HUP
   set +e
   compose stop app >/dev/null 2>&1 || rollback_ok=0
   if ((BACKUP_COMPLETE)); then
@@ -255,6 +264,19 @@ preflight() {
   [[ -n "$OLD_IMAGE_ID" ]] || die 'could not determine the current image ID'
   RUNTIME_VOLUME="$(docker inspect --format='{{range .Mounts}}{{if eq .Destination "/app"}}{{.Name}}{{end}}{{end}}' "$APP_CONTAINER")"
   [[ -n "$RUNTIME_VOLUME" ]] || die 'chatgpt2api /app runtime volume is missing'
+
+  # The entrypoint reseeds /app from the image, discarding a console online update. Refuse
+  # when the running code is not the image seed or not the source version.
+  local running_version seed_version
+  SOURCE_VERSION="$(tr -d '\r\n' <"$SOURCE_DIR/VERSION")" || die 'source VERSION is missing'
+  running_version="$(docker exec "$APP_CONTAINER" cat /app/VERSION | tr -d '\r\n')" \
+    || die 'could not read the running /app/VERSION'
+  seed_version="$(docker exec "$APP_CONTAINER" cat /opt/chatgpt2api/VERSION | tr -d '\r\n')" \
+    || die 'could not read the current image seed VERSION'
+  [[ "$running_version" == "$seed_version" ]] \
+    || die "running /app is version ${running_version}, not its image seed ${seed_version} (console online update?); a rollback could not restore it"
+  [[ "$running_version" == "$SOURCE_VERSION" ]] \
+    || die "running version ${running_version} differs from source VERSION ${SOURCE_VERSION}; use the release upgrade path instead"
   db_bytes="$(stat -c '%s' "$DB_FILE")"
   available_kb="$(df -Pk "$INSTALL_DIR" | awk 'NR == 2 {print $4}')"
   [[ "$available_kb" =~ ^[0-9]+$ ]] || die 'could not determine free disk space'
@@ -267,6 +289,7 @@ preflight() {
 
 print_summary() {
   printf 'Source commit: %s\n' "$SOURCE_COMMIT"
+  printf 'Version: %s\n' "$SOURCE_VERSION"
   printf 'Install directory: %s\n' "$INSTALL_DIR"
   printf 'Local image: %s\n' "$NEW_IMAGE_TAG"
   printf 'Backup directory: %s\n' "$BACKUP_DIR"
@@ -314,10 +337,21 @@ restore_database() {
   done
 }
 
+on_signal() {
+  if ((MUTATING)); then
+    printf 'Interrupted while the app was being replaced; attempting rollback.\n' >&2
+    rollback || true
+  fi
+  exit 130
+}
+
 upgrade() {
   confirm_upgrade || die 'upgrade cancelled'
   docker build -t "$NEW_IMAGE_TAG" "$SOURCE_DIR" || die 'local Docker build failed; production was not changed'
   docker tag "$OLD_IMAGE_ID" "$ROLLBACK_IMAGE_TAG" || die 'could not create rollback image tag'
+  # From here an interrupt (Ctrl-C, SSH hangup) would leave the app stopped, so roll back.
+  MUTATING=1
+  trap on_signal INT TERM HUP
   if ! compose stop app; then
     printf 'Could not stop the app service cleanly; attempting to restart the old application.\n' >&2
     rollback || true
@@ -349,6 +383,8 @@ upgrade() {
     rollback || true
     exit 1
   fi
+  MUTATING=0
+  trap - INT TERM HUP
   printf 'Upgrade succeeded.\n'
   printf 'Source commit: %s\n' "$SOURCE_COMMIT"
   printf 'Image: %s\n' "$NEW_IMAGE_TAG"

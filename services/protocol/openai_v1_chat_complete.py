@@ -26,11 +26,11 @@ from services.protocol.openai_tool_call_bridge import (
     UpstreamToolCallError,
     build_tool_instruction,
     has_tool_history,
-    looks_like_envelope_start,
     normalize_tool_choice,
     normalize_tools,
     parse_tool_call_envelope,
     serialize_tool_history,
+    split_envelope_hold,
 )
 from services.protocol.reasoning import thinking_effort_from_body
 from services.protocol.web_search_tool import (
@@ -435,6 +435,22 @@ def _stream_tool_completion_events(
     backend = text_backend()
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    role_sent = False
+
+    def chunk(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
+        return _with_log_metadata(
+            completion_chunk(model, delta, finish_reason, completion_id, created),
+            _backend_account_email(backend),
+        )
+
+    def content_chunk(content: str) -> dict[str, Any]:
+        nonlocal role_sent
+        delta: dict[str, Any] = {"content": content}
+        if not role_sent:
+            delta = {"role": "assistant", "content": content}
+            role_sent = True
+        return chunk(delta)
+
     try:
         request = ConversationRequest(
             model=model,
@@ -442,72 +458,36 @@ def _stream_tool_completion_events(
             thinking_effort=thinking_effort_from_body(body),
         )
         deltas = stream_text_deltas(backend, request)
-        text = ""
         if tool_choice.get("mode") in {"auto", "none"}:
-            # Stream plain-text answers as they arrive; buffer only replies that may be an envelope.
+            # Stream prose as it arrives; hold back only a tail that may still become the envelope,
+            # so prose followed by a call never leaks the private envelope as content.
+            held = ""
+            committed = False
             for delta in deltas:
-                text += delta
-                if not text.strip():
+                held += delta
+                if committed:
                     continue
-                if looks_like_envelope_start(text):
-                    break
-                yield _with_log_metadata(
-                    completion_chunk(model, {"role": "assistant", "content": text}, None, completion_id, created),
-                    _backend_account_email(backend),
-                )
-                for rest in deltas:
-                    if rest:
-                        yield _with_log_metadata(
-                            completion_chunk(model, {"content": rest}, None, completion_id, created),
-                            _backend_account_email(backend),
-                        )
-                yield _with_log_metadata(
-                    completion_chunk(model, {}, "stop", completion_id, created),
-                    _backend_account_email(backend),
-                )
-                return
-        text += "".join(deltas)
+                released, held, committed = split_envelope_hold(held)
+                if released:
+                    yield content_chunk(released)
+        else:
+            held = "".join(deltas)
         try:
-            answer, calls = parse_tool_call_envelope(text, tools, tool_choice, parallel=parallel)
+            answer, calls = parse_tool_call_envelope(held, tools, tool_choice, parallel=parallel)
         except UpstreamToolCallError as exc:
             raise HTTPException(status_code=502, detail={"error": "upstream tool-call response was invalid"}) from exc
 
         if calls:
-            yield _with_log_metadata(
-                completion_chunk(model, {"role": "assistant"}, None, completion_id, created),
-                _backend_account_email(backend),
-            )
+            if not role_sent:
+                yield chunk({"role": "assistant"})
             for index, call in enumerate(calls):
-                yield _with_log_metadata(
-                    completion_chunk(
-                        model,
-                        {"tool_calls": [{"index": index, **call}]},
-                        None,
-                        completion_id,
-                        created,
-                    ),
-                    _backend_account_email(backend),
-                )
-            yield _with_log_metadata(
-                completion_chunk(model, {}, "tool_calls", completion_id, created),
-                _backend_account_email(backend),
-            )
+                yield chunk({"tool_calls": [{"index": index, **call}]})
+            yield chunk({}, "tool_calls")
             return
 
-        if answer:
-            yield _with_log_metadata(
-                completion_chunk(model, {"role": "assistant", "content": answer}, None, completion_id, created),
-                _backend_account_email(backend),
-            )
-        else:
-            yield _with_log_metadata(
-                completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created),
-                _backend_account_email(backend),
-            )
-        yield _with_log_metadata(
-            completion_chunk(model, {}, "stop", completion_id, created),
-            _backend_account_email(backend),
-        )
+        if answer or not role_sent:
+            yield content_chunk(answer)
+        yield chunk({}, "stop")
     finally:
         backend.close()
 

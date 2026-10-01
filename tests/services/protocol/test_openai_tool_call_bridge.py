@@ -6,10 +6,12 @@ from services.protocol.openai_tool_call_bridge import (
     ToolCallRequestError,
     UpstreamToolCallError,
     build_tool_instruction,
+    envelope_hold_state,
     normalize_tool_choice,
     normalize_tools,
     parse_tool_call_envelope,
     serialize_tool_history,
+    split_envelope_hold,
 )
 
 
@@ -359,6 +361,50 @@ def test_serialize_tool_history_rejects_duplicate_tool_call_ids():
             {"role": "assistant", "tool_calls": [{"id": "call_a", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "call_a", "content": "result"},
         ])
+
+
+def test_serialize_tool_history_treats_empty_arguments_as_empty_object():
+    history = serialize_tool_history([
+        {"role": "assistant", "tool_calls": [{"id": "call_a", "type": "function", "function": {"name": "lookup", "arguments": ""}}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "result"},
+    ])
+
+    assert '"arguments":"{}"' in history[0]["content"]
+
+
+@pytest.mark.parametrize(
+    ("text", "state"),
+    [
+        ("{", "candidate"),
+        ('{ "__chatgpt2', "candidate"),
+        ('{"tool', "candidate"),
+        ('{"__chatgpt2api_tool_call__": true', "committed"),
+        ('{\n  "tool_calls": [', "committed"),
+        ('{"a": 1}', "release"),
+        ("`", "candidate"),
+        ("``", "candidate"),
+        ("`x`", "release"),
+        ("```", "candidate"),
+        ("```json", "candidate"),
+        ("```json\n", "candidate"),
+        ('```json\n{"__chatgpt2api_tool_call__"', "committed"),
+        ("```python\nprint(1)", "release"),
+        ("```has spaces in info", "release"),
+    ],
+)
+def test_envelope_hold_state_classifies_stream_tails(text, state):
+    assert envelope_hold_state(text) == state
+
+
+def test_split_envelope_hold_releases_prose_and_holds_envelope_tail():
+    assert split_envelope_hold("Hi {\"a\": 1} and `x` ok") == ("Hi {\"a\": 1} and `x` ok", "", False)
+    assert split_envelope_hold("Say `x`") == ("Say `x", "`", False)
+    assert split_envelope_hold("Calling: {\"__chatgpt2api_tool_call__\":true") == (
+        "Calling: ",
+        "{\"__chatgpt2api_tool_call__\":true",
+        True,
+    )
+    assert split_envelope_hold("Look {\"tool") == ("Look ", "{\"tool", False)
 
 
 def test_parse_tool_call_envelope_rejects_malformed_marked_json():

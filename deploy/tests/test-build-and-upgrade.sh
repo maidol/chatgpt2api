@@ -98,6 +98,8 @@ EOF
   printf 'seeded-runtime\n' >"$state/marker"
   printf 'running\n' >"$state/app_state"
   printf 'old-image-id\n' >"$state/image_id"
+  printf '3.2.3\n' >"$state/app_version"
+  printf '3.2.3\n' >"$state/seed_version"
   : >"$state/commands.log"
 
   cat >"$fake_bin/docker" <<'EOF'
@@ -130,6 +132,14 @@ if [[ "${1:-}" == inspect ]]; then
   fi
   exit 0
 fi
+if [[ "${1:-}" == exec ]]; then
+  case "${*: -1}" in
+    /app/VERSION) cat "$state/app_version" ;;
+    /opt/chatgpt2api/VERSION) cat "$state/seed_version" ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
 if [[ "${1:-}" == build ]]; then
   if [[ "${FAKE_BUILD_FAIL:-0}" == 1 ]]; then exit 41; fi
   exit 0
@@ -158,6 +168,19 @@ if [[ "${1:-}" == compose ]]; then
     if grep -q '^CHATGPT2API_IMAGE=chatgpt2api:branch-' "$INSTALL_DIR/.env"; then
       printf 'new-wal\n' >"$INSTALL_DIR/data/chatgpt2api.db-wal"
       printf 'new-shm\n' >"$INSTALL_DIR/data/chatgpt2api.db-shm"
+      if [[ "${FAKE_SIGNAL_ON_UP:-0}" == 1 ]]; then
+        # Simulate an operator hangup: signal the top-level upgrade script (not its compose
+        # subshell, which shares its command line) while it waits on us.
+        pid="$PPID"
+        target=""
+        while [[ -n "$pid" && "$pid" -gt 1 ]]; do
+          if ps -o args= -p "$pid" | grep -q '/deploy/build-and-upgrade\.sh'; then
+            target="$pid"
+          fi
+          pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+        done
+        [[ -n "$target" ]] && kill -TERM "$target"
+      fi
     fi
   fi
   if [[ "${FAKE_COMPOSE_FAIL:-0}" == 1 && "${*}" == *" up "* && ! -e "$state/compose_failed" ]]; then
@@ -339,6 +362,35 @@ case "${1:-all}" in
     assert_file_contains "$install/.env" 'CHATGPT2API_IMAGE=chatgpt2api:rollback-'
     assert_file_equals "$install/data/chatgpt2api.db" "$WORK_DIR/compose.before.db"
     [[ "$(tr -d '\n' <"$state/app_state")" == running ]] || fail 'compose failure did not restore running app'
+
+    make_fixture
+    source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
+    cp "$install/data/chatgpt2api.db" "$WORK_DIR/signal.before.db"
+    if FAKE_SIGNAL_ON_UP=1 run_upgrade "$source" "$install" "$fake_bin" "$state" 2>"$WORK_DIR/signal.err"; then
+      fail 'interrupted upgrade unexpectedly succeeded'
+    fi
+    assert_file_contains "$WORK_DIR/signal.err" 'Interrupted while the app was being replaced'
+    assert_file_contains "$install/.env" 'CHATGPT2API_IMAGE=chatgpt2api:rollback-'
+    assert_file_equals "$install/data/chatgpt2api.db" "$WORK_DIR/signal.before.db"
+    [[ ! -e "$install/data/chatgpt2api.db-shm" ]] || fail 'interrupted upgrade left the new SQLite SHM file in place'
+    [[ "$(tr -d '\n' <"$state/app_state")" == running ]] || fail 'interrupted upgrade did not restore running app'
+
+    make_fixture
+    source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
+    printf '3.2.4\n' >"$state/app_version"
+    if run_upgrade "$source" "$install" "$fake_bin" "$state" --dry-run 2>"$WORK_DIR/online-update.err"; then
+      fail 'online-updated runtime unexpectedly passed preflight'
+    fi
+    assert_file_contains "$WORK_DIR/online-update.err" 'online update'
+
+    make_fixture
+    source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
+    printf '3.2.2\n' >"$state/app_version"
+    printf '3.2.2\n' >"$state/seed_version"
+    if run_upgrade "$source" "$install" "$fake_bin" "$state" --dry-run 2>"$WORK_DIR/version.err"; then
+      fail 'version change unexpectedly passed preflight'
+    fi
+    assert_file_contains "$WORK_DIR/version.err" 'differs from source VERSION'
 
     make_fixture
     source="$FIXTURE_SOURCE"; install="$FIXTURE_INSTALL"; fake_bin="$FIXTURE_FAKE_BIN"; state="$FIXTURE_STATE"
