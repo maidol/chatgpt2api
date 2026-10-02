@@ -34,6 +34,12 @@ from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
+from services.openai_oauth import (
+    codex_auth_originator,
+    codex_auth_user_agent,
+    codex_oauth_client_id,
+    codex_oauth_refresh_scope,
+)
 from services.storage.base import (
     StorageBackend,
     StorageMutation,
@@ -1296,6 +1302,19 @@ class AccountService:
             return False
         return (datetime.now(timezone.utc) - last_error_at).total_seconds() < self._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
 
+    def _refresh_client_id(self, account: dict | None) -> str:
+        """refresh_token 只能由签发它的 client 刷新：先认添加账号时记下的，再认 AT 自带的 client_id 声明。
+
+        不按 source_type 推断——来源标签可以在控制台手改，签发方改不了。
+        """
+        account = account or {}
+        stored = str(account.get("oauth_client_id") or "").strip()
+        if stored:
+            return stored
+        claims = self._decode_jwt_payload(str(account.get("access_token") or ""))
+        claimed = str(claims.get("client_id") or "").strip()
+        return claimed or self._OAUTH_CLIENT_ID
+
     def _request_access_token_refresh(
         self,
         refresh_token: str,
@@ -1306,21 +1325,30 @@ class AccountService:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
+        client_id = self._refresh_client_id(account)
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": self._OAUTH_USER_AGENT,
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+        if client_id == codex_oauth_client_id:
+            # 与 sub2api BuildRefreshTokenRequest 一致：Codex 刷新带 scope 与 Codex 身份头。
+            headers["User-Agent"] = codex_auth_user_agent
+            headers["originator"] = codex_auth_originator
+            data["scope"] = codex_oauth_refresh_scope
+
         session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
         try:
             with account_processing_slot():
                 response = session.post(
                     self._OAUTH_TOKEN_URL,
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": self._OAUTH_USER_AGENT,
-                    },
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": self._OAUTH_CLIENT_ID,
-                    },
+                    headers=headers,
+                    data=data,
                     timeout=60,
                 )
             raw_text = self._safe_response_text(response)

@@ -23,6 +23,12 @@ from curl_cffi import requests
 
 from services.openai_oauth import (
     auth_base,
+    codex_auth_originator,
+    codex_auth_user_agent,
+    codex_oauth_authorize_url,
+    codex_oauth_client_id,
+    codex_oauth_redirect_uri,
+    codex_oauth_token_url,
     common_headers,
     platform_auth0_client,
     platform_base,
@@ -66,40 +72,59 @@ class OAuthLoginService:
             for sid, _ in ordered[: len(self._sessions) - self._MAX_SESSIONS]:
                 self._sessions.pop(sid, None)
 
-    def start(self, email_hint: str = "") -> dict[str, str]:
+    def start(self, email_hint: str = "", client: str = "web") -> dict[str, str]:
         """登记一个新的 PKCE 会话，返回 session_id 与可让用户打开的 authorize_url。
 
         state 形如 "<session_id>.<nonce>"，让 callback URL 自带 session_id，
         finish 时即便前端 React 状态被覆盖也能从 URL 恢复正确的 verifier。
+        client="codex" 走 Codex CLI 的 OAuth 客户端，签发的 token 才能调 codex 通道；
+        其余取值一律按原来的 platform 网页登录处理。
         """
+        client = "codex" if str(client or "").strip().lower() == "codex" else "web"
         verifier, challenge = self._generate_pkce()
         nonce = secrets.token_urlsafe(32)
         device_id = str(uuid.uuid4())
         session_id = uuid.uuid4().hex
         state = f"{session_id}.{secrets.token_urlsafe(16)}"
 
-        params = {
-            "issuer": auth_base,
-            "client_id": platform_oauth_client_id,
-            "audience": platform_oauth_audience,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "device_id": device_id,
-            "screen_hint": "login_or_signup",
-            "max_age": "0",
-            "scope": "openid profile email offline_access",
-            "response_type": "code",
-            "response_mode": "query",
-            "state": state,
-            "nonce": nonce,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "auth0Client": platform_auth0_client,
-        }
-        email_hint = str(email_hint or "").strip()
-        if email_hint:
-            params["login_hint"] = email_hint
-
-        authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+        if client == "codex":
+            # 参数与 sub2api BuildAuthorizationURLForPlatform 一致，不带 platform 专属的 audience / auth0Client。
+            redirect_uri = codex_oauth_redirect_uri
+            params = {
+                "response_type": "code",
+                "client_id": codex_oauth_client_id,
+                "redirect_uri": redirect_uri,
+                "scope": "openid profile email offline_access",
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "id_token_add_organizations": "true",
+                "codex_cli_simplified_flow": "true",
+            }
+            authorize_url = f"{codex_oauth_authorize_url}?{urlencode(params)}"
+        else:
+            redirect_uri = platform_oauth_redirect_uri
+            params = {
+                "issuer": auth_base,
+                "client_id": platform_oauth_client_id,
+                "audience": platform_oauth_audience,
+                "redirect_uri": redirect_uri,
+                "device_id": device_id,
+                "screen_hint": "login_or_signup",
+                "max_age": "0",
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": state,
+                "nonce": nonce,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "auth0Client": platform_auth0_client,
+            }
+            email_hint = str(email_hint or "").strip()
+            if email_hint:
+                params["login_hint"] = email_hint
+            authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
 
         with self._lock:
             self._purge_expired_locked()
@@ -107,14 +132,16 @@ class OAuthLoginService:
                 "code_verifier": verifier,
                 "state": state,
                 "created_at": time.time(),
-                "redirect_uri": platform_oauth_redirect_uri,
+                "redirect_uri": redirect_uri,
+                "client": client,
             }
 
         return {
             "session_id": session_id,
             "authorize_url": authorize_url,
             "expires_in": str(self._SESSION_TTL_SECONDS),
-            "redirect_uri_prefix": platform_oauth_redirect_uri,
+            "redirect_uri_prefix": redirect_uri,
+            "client": client,
         }
 
     @staticmethod
@@ -180,41 +207,63 @@ class OAuthLoginService:
                 "state 不匹配。常见原因：你点过两次\"打开授权页面\"，但浏览器里登录的还是前一次的窗口。请点\"重新生成\"重来。"
             )
 
+        client = session.get("client") or "web"
         tokens = self._exchange_code(
             code,
             session["code_verifier"],
             session.get("redirect_uri") or platform_oauth_redirect_uri,
+            client,
         )
         # 仅在成功兑换之后才消耗 session
         with self._lock:
             self._sessions.pop(picked_sid, None)
-        return tokens
+        return {**tokens, "client": client}
 
     @staticmethod
-    def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
-        """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
+    def _exchange_code(code: str, code_verifier: str, redirect_uri: str, client: str = "web") -> dict[str, str]:
+        """用 code+verifier 换 token 三件套；codex 走 /oauth/token 表单，网页走 /api/accounts/oauth/token。"""
         kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=False)
         session = requests.Session(**kwargs)
         try:
-            response = session.post(
-                f"{auth_base}/api/accounts/oauth/token",
-                headers={
-                    **common_headers,
-                    "referer": f"{platform_base}/",
-                    "origin": platform_base,
-                    "auth0-client": platform_auth0_client,
-                    "sec-ch-ua": sec_ch_ua,
-                    "user-agent": user_agent,
-                },
-                json={
-                    "client_id": platform_oauth_client_id,
-                    "code_verifier": code_verifier,
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": redirect_uri,
-                },
-                timeout=60,
-            )
+            if client == "codex":
+                # 与 sub2api openaiOAuthService.ExchangeCode 一致：表单编码 + Codex 身份头。
+                response = session.post(
+                    codex_oauth_token_url,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": codex_auth_user_agent,
+                        "originator": codex_auth_originator,
+                    },
+                    data={
+                        "grant_type": "authorization_code",
+                        "client_id": codex_oauth_client_id,
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                        "code_verifier": code_verifier,
+                    },
+                    timeout=60,
+                )
+            else:
+                response = session.post(
+                    f"{auth_base}/api/accounts/oauth/token",
+                    headers={
+                        **common_headers,
+                        "referer": f"{platform_base}/",
+                        "origin": platform_base,
+                        "auth0-client": platform_auth0_client,
+                        "sec-ch-ua": sec_ch_ua,
+                        "user-agent": user_agent,
+                    },
+                    json={
+                        "client_id": platform_oauth_client_id,
+                        "code_verifier": code_verifier,
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                    },
+                    timeout=60,
+                )
         except Exception as exc:
             raise OAuthLoginError(f"换 token 网络异常: {exc}") from exc
         finally:

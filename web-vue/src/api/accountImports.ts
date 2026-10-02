@@ -11,7 +11,10 @@ export interface OAuthLoginStartResponse {
   authorize_url: string
   expires_in: string
   redirect_uri_prefix: string
+  client?: OAuthLoginClient
 }
+
+export type OAuthLoginClient = 'web' | 'codex'
 
 export interface CPAImportJob {
   job_id: string
@@ -107,10 +110,10 @@ export interface Sub2APIImportGroupBinding {
 }
 
 export const accountImportsApi = {
-  startOAuthLogin: (emailHint = '') =>
-    apiClient.post<{ email_hint: string }, OAuthLoginStartResponse>(
+  startOAuthLogin: (emailHint = '', client: OAuthLoginClient = 'web') =>
+    apiClient.post<{ email_hint: string; client: OAuthLoginClient }, OAuthLoginStartResponse>(
       '/api/accounts/oauth/start',
-      { email_hint: emailHint },
+      { email_hint: emailHint, client },
     ),
 
   finishOAuthLogin: (sessionId: string, callback: string, targetGroupId: string | null = null) =>

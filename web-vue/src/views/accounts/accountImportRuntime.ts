@@ -1,8 +1,9 @@
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 
 import { accountsApi, type AccountImportPayload, type AccountSourceType } from '@/api/accounts'
 import {
   accountImportsApi,
+  type OAuthLoginClient,
   type RemoteAccountImportStarted,
 } from '@/api/accountImports'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
@@ -155,6 +156,14 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
   const oauthSessionId = ref('')
   const oauthAuthorizeUrl = ref('')
   const oauthRedirectUriPrefix = ref('')
+  const oauthClient = ref<OAuthLoginClient>('web')
+  // 已生成的授权会话属于切换前的登录类型；清掉，免得界面显示的类型和要完成的会话对不上。
+  watch(oauthClient, () => {
+    oauthSessionId.value = ''
+    oauthAuthorizeUrl.value = ''
+    oauthRedirectUriPrefix.value = ''
+    oauthCallbackText.value = ''
+  })
   const manualTokenText = ref('')
   const sessionJsonText = ref('')
   const toast = useToast()
@@ -452,7 +461,7 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
   async function startOAuthLogin() {
     importBusy.value = true
     try {
-      const result = await accountImportsApi.startOAuthLogin(oauthEmailHint.value)
+      const result = await accountImportsApi.startOAuthLogin(oauthEmailHint.value, oauthClient.value)
       oauthSessionId.value = String(result.session_id || '')
       oauthAuthorizeUrl.value = String(result.authorize_url || '')
       oauthRedirectUriPrefix.value = String(result.redirect_uri_prefix || '')
@@ -704,6 +713,7 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     oauthSessionId,
     oauthAuthorizeUrl,
     oauthRedirectUriPrefix,
+    oauthClient,
     manualTokenText,
     sessionJsonText,
     setImportMode,

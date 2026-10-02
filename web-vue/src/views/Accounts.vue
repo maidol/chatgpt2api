@@ -602,6 +602,18 @@
                     description="用浏览器登录 ChatGPT，回填 callback URL 后保存 RT，用于 AT 临期自动续期。"
                   />
                   <div class="grid grid-cols-1 gap-3">
+                    <div class="text-xs">
+                      <span class="ui-field-label">登录类型</span>
+                      <GroupedSelectMenu
+                        :model-value="oauthClient"
+                        :options="oauthClientOptions"
+                        selected-indicator="none"
+                        aria-label="OAuth 登录类型"
+                        block
+                        :disabled="importBusy"
+                        @update:model-value="oauthClient = $event === 'codex' ? 'codex' : 'web'"
+                      />
+                    </div>
                     <label class="block text-xs">
                       <span class="ui-field-label">账号邮箱（可选）</span>
                       <Input
@@ -629,6 +641,7 @@
                     <SurfaceBox v-if="oauthAuthorizeUrl" tone="muted" density="compact" wrap>
                       授权链接已生成。登录完成后，把浏览器最终跳转到的 callback URL 粘贴到下方。
                       <span v-if="oauthRedirectUriPrefix">目标地址：{{ oauthRedirectUriPrefix }}</span>
+                      <span v-if="oauthClient === 'codex'">Codex 登录会跳到 localhost:1455，页面打不开是正常的，复制地址栏里的完整 URL 即可。</span>
                     </SurfaceBox>
 
                     <label class="block text-xs">
@@ -852,6 +865,7 @@ const {
   oauthSessionId,
   oauthAuthorizeUrl,
   oauthRedirectUriPrefix,
+  oauthClient,
   manualTokenText,
   sessionJsonText,
   accountGroups,
@@ -962,6 +976,10 @@ const accountToolbarSecondaryClass = `${accountToolbarButtonClass} text-muted-fo
 const accountSourceOptions = [
   { label: 'Web', value: 'web' },
   { label: 'Codex', value: 'codex' },
+] as const
+const oauthClientOptions = [
+  { label: '网页（platform，文本/生图）', value: 'web' },
+  { label: 'Codex（可走原生工具调用）', value: 'codex' },
 ] as const
 const importModalBusy = computed(() => importBusy.value || remoteImportBusy.value)
 const resolvedImportTargetGroupId = computed(() => (

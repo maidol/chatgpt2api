@@ -44,6 +44,7 @@ from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.log_service import LoggedCall
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
+from services.openai_oauth import codex_oauth_client_id
 from services.proxy_management_service import project_proxy_assignment, proxy_management_service
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
@@ -199,8 +200,9 @@ class Sub2APIImportRequest(BaseModel):
 
 
 class OAuthLoginStartRequest(BaseModel):
-    """起始 OAuth 桥。email_hint 可选，仅用于让 OpenAI 登录页预填邮箱。"""
+    """起始 OAuth 桥。email_hint 可选，仅用于让 OpenAI 登录页预填邮箱；client 为 web（默认）或 codex。"""
     email_hint: str = ""
+    client: str = "web"
 
 
 class OAuthLoginFinishRequest(BaseModel):
@@ -2150,7 +2152,7 @@ def create_router() -> APIRouter:
         """登记一次 PKCE 会话，返回可让用户浏览器打开的 authorize URL。"""
         require_admin(authorization)
         try:
-            return await run_in_threadpool(oauth_login_service.start, body.email_hint)
+            return await run_in_threadpool(oauth_login_service.start, body.email_hint, body.client)
         except OAuthLoginError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -2174,12 +2176,16 @@ def create_router() -> APIRouter:
             print(f"[oauth-login] finish rejected: {type(exc).__name__}", flush=True)
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
+        is_codex = tokens.get("client") == "codex"
         payload = {
             "access_token": tokens["access_token"],
             "refresh_token": tokens["refresh_token"],
             "id_token": tokens["id_token"],
-            "source_type": "web",
+            "source_type": "codex" if is_codex else "web",
         }
+        if is_codex:
+            # 刷新时要用签发这枚 refresh_token 的 client_id，见 AccountService._refresh_client_id。
+            payload["oauth_client_id"] = codex_oauth_client_id
         target_group_id = _target_account_group_id(body.target_group_id)
         if target_group_id is not None:
             payload["group_id"] = target_group_id

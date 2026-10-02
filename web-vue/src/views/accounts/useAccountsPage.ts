@@ -226,6 +226,7 @@ export function useAccountsPage() {
   const oauthSessionId = accountImport.oauthSessionId
   const oauthAuthorizeUrl = accountImport.oauthAuthorizeUrl
   const oauthRedirectUriPrefix = accountImport.oauthRedirectUriPrefix
+  const oauthClient = accountImport.oauthClient
   const manualTokenText = accountImport.manualTokenText
   const sessionJsonText = accountImport.sessionJsonText
 
@@ -426,6 +427,7 @@ export function useAccountsPage() {
     oauthSessionId,
     oauthAuthorizeUrl,
     oauthRedirectUriPrefix,
+    oauthClient,
     manualTokenText,
     sessionJsonText,
     accountGroups,

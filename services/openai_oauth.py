@@ -10,6 +10,16 @@ platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
 
+# Codex CLI 的 OAuth 客户端：只有它签发的 token 能调 /backend-api/codex/responses。
+# 取值与 sub2api internal/pkg/openai/oauth.go、openai_codex_identity.go 一致。
+codex_oauth_client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+codex_oauth_authorize_url = f"{auth_base}/oauth/authorize"
+codex_oauth_token_url = f"{auth_base}/oauth/token"
+codex_oauth_redirect_uri = "http://localhost:1455/auth/callback"
+codex_oauth_refresh_scope = "openid profile email"
+codex_auth_user_agent = "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
+codex_auth_originator = "codex-tui"
+
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
