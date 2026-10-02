@@ -7,6 +7,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.protocol.codex_tool_passthrough import codex_tool_response_events
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -452,6 +453,11 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    if has_unsupported_response_tools(body):
+        codex_events = codex_tool_response_events(body)
+        if codex_events is not None:
+            yield from codex_events
+            return
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
         if has_web_search_tool(body) and not has_unsupported_response_tools(body):

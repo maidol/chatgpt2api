@@ -113,6 +113,7 @@ CODEX_RESPONSES_INSTRUCTIONS = (
     "Use the image_generation tool to create exactly one image for the user's request. "
     "Return the generated image result."
 )
+CODEX_TEXT_STREAM_TIMEOUT_SECS = 300
 
 def _ms_from_seconds(value: Any) -> int:
     try:
@@ -1166,6 +1167,32 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
             self._log_codex_response_failure(path, error.code, error.headers, payload, body)
+            retry_after_header = error.headers.get("Retry-After") if error.headers else None
+            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
+            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+
+    def iter_codex_responses_events(self, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        """把客户端的 Responses 请求转发到 codex/responses，工具由上游原生处理、客户端执行。"""
+        if not self.access_token:
+            raise RuntimeError("access_token is required for codex responses")
+        self._ensure_codex_source_account()
+        path = "/backend-api/codex/responses"
+        request = urllib.request.Request(
+            self.base_url + path,
+            json.dumps(payload).encode(),
+            self._codex_responses_headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=CODEX_TEXT_STREAM_TIMEOUT_SECS) as raw:
+                yield from self._iter_codex_response_events(raw, max_duration_secs=CODEX_TEXT_STREAM_TIMEOUT_SECS)
+        except urllib.error.HTTPError as error:
+            body_text = error.read().decode("utf-8", "replace")
+            body: Any = body_text
+            try:
+                body = json.loads(body_text)
+            except Exception:
+                pass
             retry_after_header = error.headers.get("Retry-After") if error.headers else None
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
